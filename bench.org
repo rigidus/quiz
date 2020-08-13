@@ -1,0 +1,179 @@
+#+STARTUP: showall indent hidestars
+
+* Задачка на теорию вероятностей
+
+На семиместную скамейку случайным образом рассаживается 7 человек.
+Какова вероятность того, что два определённых человека окажутся рядом?
+
+Количество всех возможных исходов: 7! = 5040
+
+|   | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---+---+---+---+---+---+---+---|
+| 1 | A | B |   |   |   |   |   |
+| 2 |   | A | B |   |   |   |   |
+| 3 |   |   | A | B |   |   |   |
+| 4 |   |   |   | A | B |   |   |
+| 5 |   |   |   |   | A | B |   |
+| 6 |   |   |   |   |   | A | B |
+
+Есть 6 вариантов когда A сидит впереди B. Если А и В поменять местами
+будет еще столько же, значит всего - 12.
+
+Когда A и B сидят вместе (как в одном из случаев из таблицы), остальные 5
+человек могут разместиться 5!=120 разными способами.
+
+Таким образом существует 5!*12=1440 благоприятных исходов из 5040 всего.
+1440/5040 = 2/7
+
+Проверим кодом. Т.к. я хочу получить все возможные перестановки, мне
+нужно создать кольцо из 7 элементов, которые будут представлять собой
+людей. Этот параментр настраиваемый
+
+Сюда же положим начальное состояние скамейки для перебора всех
+перестановок.
+
+#+NAME: config
+#+BEGIN_SRC lisp
+  (defparameter *the-ring* '('a 'b 'c 'd 'e 'f 'g))
+
+  (defparameter *bench* '(a a a a a a a))
+#+END_SRC
+
+Мне также понадобится операция инкремента в кольце. Так как я заранее не
+знаю, сколько элементов может быть в кольце, я сделаю это
+макросом. Макрос будет формировать COND который будет возвращать второе
+значение Т, если в переменной-ппараметре был последний элемент
+кольца. Так можно получить "флаг переноса"
+
+#+NAME: ring_inc
+#+BEGIN_SRC lisp
+  (defmacro ring-inc (var)
+    (let* ((clauses
+            (loop for idx from 0 to (- (length *the-ring*) 1)
+               collect `(,(nth idx *the-ring*)  ,(nth (+ 1 idx) *the-ring*)))))
+      `(cond ,@(loop for mcase in clauses
+                  collect `((equal ,var ,(car mcase))  ,(let ((it (cadr mcase)))
+                                                          (if it it `(values ,(car *the-ring*) t))))))))
+
+  ;; (format nil "~A" (macroexpand-1 '(ring-inc elt)))
+  ;; => (cond ((equal elt 'a) 'b)
+  ;;          ((equal elt 'b) 'c)
+  ;;          ((equal elt 'c) 'd)
+  ;;          ((equal elt 'd) 'e)
+  ;;          ((equal elt 'e) 'f)
+  ;;          ((equal elt 'f) 'g)
+  ;;          ((equal elt 'g) (values 'a t)))
+#+END_SRC
+
+Теперь можно создать функцию, которая делает инкремент в кольце. Я сделаю
+ее локальной, чтобы она была thread-safe.
+
+Функция использует одну локальную переменную и сигнализирует условие,
+если все перестановки перебраны.
+
+В качестве параметра функция принимает позицию внутри ~current~~. Если
+произошло переполнение, функция рекурсивно вызывает себя, но уже со
+сдвинутой позицией.
+
+Нам также нужно определить условие, которое будет сигнализировать
+~incrementor~. Для основной функции это сигнал завершить работу
+
+Основная функция ~process~ прогоняет каждую полученную комбинацию через
+фильтры-предикаты ~test-seq~ и ~test-seq2~. Если комбинация прошла
+фильтры - она сохраняется в ~acc~, который будет возвращен.
+
+#+NAME: process
+#+BEGIN_SRC lisp
+  (define-condition overflow-error (error)
+    ((text :initarg :text :reader text)))
+
+  (defun process (pos)
+    (let ((current *bench*)
+          (acc))
+        (labels ((incrementor (pos)
+                   (when (<= (length current) pos)
+                     (error 'overflow-error :text "OVERFLOW-ERROR in INCREMENTOR"))
+                   (multiple-value-bind (result carry)
+                       (ring-inc (nth pos current))
+                     (setf (nth pos current) result)
+                     (when carry
+                       (incrementor (+ 1 pos))))
+                   current))
+          (handler-case (loop for var = current then (incrementor pos)
+                           do (when (and (test-seq  current)
+                                         (test-seq2 current))
+                                (push (copy-list current) acc)))
+            (overflow-error () 'fin))
+          acc)))
+#+END_SRC
+
+Этот фильтр-предикат следит, чтобы один человек не мог сесть на два места одновременно
+
+#+NAME: test_seq
+#+BEGIN_SRC lisp
+    (defun test-seq (param)
+      (let ((known))
+        (flet ((test-local (param)
+                 (if (find param known)
+                     nil
+                     (prog1 t (push param known)))))
+          (loop for elt in param always (test-local elt)))))
+#+END_SRC
+
+А этот - проверяет, что ~A~ и ~B~ - ближайшие соседи:
+
+#+NAME: test_seq2
+#+BEGIN_SRC lisp
+    (defun test-seq2 (param)
+      (loop
+         for idx from 0 to (- (length param) 1)
+         for elt in param
+         :thereis
+           (let ((prev (unless (= idx 0)
+                         (nth (- idx 1) param)))
+                 (next (unless (= idx (- (length param) 1))
+                         (nth (+ idx 1) param))))
+             (or (unless (null prev)
+                   (or (and (equal 'b elt)
+                            (equal 'a prev))
+                       (and (equal 'a elt)
+                            (equal 'b prev))))
+                 (unless (null next)
+                   (or (and (equal 'a elt)
+                            (equal 'b next))
+                       (and (equal 'b elt)
+                            (equal 'a next))))))))
+
+
+#+END_SRC
+
+Тесты
+
+#+NAME: test
+#+BEGIN_SRC lisp
+  ;; test
+  (print (process 0))
+
+  ;; time
+  (time (length (process 0)))
+
+  ;; answer
+  (/ 1440 5040)
+#+END_SRC
+
+* Сборка
+
+#+NAME:
+#+BEGIN_SRC lisp :tangle bench.lisp :noweb tangle :exports code :padline no
+  <<config>>
+
+  <<ring_inc>>
+
+  <<test_seq>>
+
+  <<test_seq2>>
+
+  <<process>>
+
+  <<test>>
+#+END_SRC
